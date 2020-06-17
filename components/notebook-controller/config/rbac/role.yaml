@@ -22,7 +22,31 @@ rules:
   - kubeflow.org
   resources:
   - notebooks/status
+  - notebooks
+  - '*'
   verbs:
   - get
   - patch
   - update
+  - list
+  - watch
+  - delete
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  - services
+  - events
+  verbs:
+  - list
+  - get
+  - watch
+  - update
+  - delete
+  - create
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - "*"
