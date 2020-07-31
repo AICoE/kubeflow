@@ -16,32 +16,42 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"os"
-	"strings"
-
 	"github.com/go-logr/logr"
 	reconcilehelper "github.com/kubeflow/kubeflow/components/common/reconcilehelper"
 	"github.com/kubeflow/kubeflow/components/notebook-controller/api/v1beta1"
 	"github.com/kubeflow/kubeflow/components/notebook-controller/pkg/culler"
 	"github.com/kubeflow/kubeflow/components/notebook-controller/pkg/metrics"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apiextensions-apiserver/examples/client-go/pkg/client/clientset/versioned/scheme"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/remotecommand"
+	"net/smtp"
+	"os"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"strings"
+	"time"
 )
 
 const DefaultContainerPort = 8888
@@ -50,6 +60,11 @@ const DefaultServingPort = 80
 // The default fsGroup of PodSecurityContext.
 // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podsecuritycontext-v1-core
 const DefaultFSGroup = int64(100)
+
+const ScaleJobPrefix = "-scale-job"
+const ScaleJobLabelKey = "scaleJobName"
+const MaintenanceLabelKey = "inMaintenance"
+const PVCUpdatedLabelValue = "pvcUpdated"
 
 /*
 We generally want to ignore (not requeue) NotFound errors, since we'll get a
@@ -76,13 +91,18 @@ type NotebookReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubeflow.org,resources=notebooks,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubeflow.org,resources=notebooks/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubeflow.org,resources=*,verbs=get;list;watch;create;update;patch;delete
+
 func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
 	log := r.Log.WithValues("notebook", req.NamespacedName)
 
 	// TODO(yanniszark): Can we avoid reconciling Events and Notebook in the same queue?
+	// Here we are reissuing STS and POD Events as Notebook Events
+	// We extract the involved NB name from the event, then record it as a Notebook event
+	// Applying the same original message, but the involved object is converted to Notebook
 	event := &corev1.Event{}
 	var getEventErr error
 	getEventErr = r.Get(ctx, req.NamespacedName, event)
@@ -97,6 +117,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			log.Error(err, "unable to fetch Notebook by looking at event")
 			return ctrl.Result{}, ignoreNotFound(err)
 		}
+		// These events
 		r.EventRecorder.Eventf(involvedNotebook, event.Type, event.Reason,
 			"Reissued from %s/%s: %s", strings.ToLower(event.InvolvedObject.Kind), event.InvolvedObject.Name, event.Message)
 	}
@@ -134,8 +155,9 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		log.Error(err, "error getting Statefulset")
 		return ctrl.Result{}, err
 	}
+
 	// Update the foundStateful object and write the result back if there are any changes
-	if !justCreated && reconcilehelper.CopyStatefulSetFields(ss, foundStateful) {
+	if !justCreated && !inMaintenance(instance) && reconcilehelper.CopyStatefulSetFields(ss, foundStateful) {
 		log.Info("Updating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
 		err = r.Update(ctx, foundStateful)
 		if err != nil {
@@ -193,6 +215,8 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 	}
 
+	// Here we check the Notebook pod's container state, if it has changed since we last
+	// updated the Notebook CR's container state, then we update the Notebook's CR status
 	// Check the pod status
 	pod := &corev1.Pod{}
 	podFound := false
@@ -210,6 +234,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			log.Info("Updating container state: ", "namespace", instance.Namespace, "name", instance.Name)
 			cs := pod.Status.ContainerStatuses[0].State
 			instance.Status.ContainerState = cs
+
 			oldConditions := instance.Status.Conditions
 			newCondition := getNextCondition(cs)
 			// Append new condition
@@ -222,6 +247,135 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			err = r.Status().Update(ctx, instance)
 			if err != nil {
 				return ctrl.Result{}, err
+			}
+		}
+	}
+
+	// check if the pod crashed and the instance is marked for PVC expansion
+	if podCrashed(pod) && inMaintenance(instance) {
+
+		pvc, _, _ := getPVCFromPod(ctx, r, pod)
+
+		if pvc == nil {
+			log.Info("Unable to find scaled up PVC.")
+		} else {
+			//Threshold := instance.Spec.ScalePVC.Threshold
+			scaleFactor := instance.Spec.ScalePVC.ScaleFactor
+			maxCapacity := instance.Spec.ScalePVC.MaxCapacity
+
+			scaledUpPVC, err := scaleUpPVC(pvc, scaleFactor, maxCapacity)
+
+			// Delete STS, so it can be reconciled again with the notebook spec and new pvc
+			err = r.Delete(ctx, ss)
+
+			pvcScaled := false
+			if err != nil {
+				log.Info("Unable to delete the STS")
+			} else {
+				// try scaling the PVC directly
+				log.Info(fmt.Sprintf("Scaling PVC: %s", scaledUpPVC.Name))
+				err = r.Patch(ctx, scaledUpPVC, client.MergeFrom(pvc))
+				if err != nil {
+					log.Info("Could not successfully scale PVC. PVC scaling is likely not supported by the backing storage class.")
+					log.Info(err.Error())
+
+					log.Info("Will try to create a new PVC and copy data over.")
+					job, scaledUpPVC, err := startPVCMaintenance(ctx, r, pod, instance, log)
+					if err != nil {
+						log.Info("Unable to start PVC Maintenance Job")
+						log.Info(err.Error())
+					} else {
+						for job.Status.Succeeded <= 0 {
+							// wait for the job to finish
+							time.Sleep(10)
+							_ = r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: job.Name}, job)
+							if job.Status.Failed > 0 {
+								break
+							}
+						}
+						if job.Status.Succeeded > 0 {
+							notebookUpdate := instance.DeepCopy()
+							for volIndex, volume := range notebookUpdate.Spec.Template.Spec.Volumes {
+								if volume.PersistentVolumeClaim.ClaimName == pvc.Name {
+									// Update PVC in pod spec
+									notebookUpdate.Spec.Template.Spec.Volumes[volIndex].PersistentVolumeClaim.ClaimName = scaledUpPVC.Name
+
+									err := r.Patch(ctx, notebookUpdate, client.MergeFrom(instance))
+
+									log.Info("Patching new scaled up PVC to notebook.")
+									if err != nil {
+										log.Info("Could not update Notebook when setting scaled up PVC. ")
+									} else {
+										// If PVC scaled
+										pvcScaled = true
+									}
+									break
+								}
+							}
+						}
+					}
+				} else {
+					// If PVC scaled
+					pvcScaled = true
+				}
+
+				if pvcScaled {
+					err := sendScaledUpEmail(instance)
+					if err != nil {
+						log.Info("Failed to send email notification.")
+						log.Info(err.Error())
+					}
+				} else {
+					// TODO: send PVC scaling failure email here
+				}
+
+				// TODO: Check if PVC was expanded before removing the label
+				// Remove Maintenance label
+				err := setNotebookLabel(ctx, r, instance, MaintenanceLabelKey, "false")
+				if err != nil {
+					log.Info("Unable to remove maintenance label.")
+					log.Info(err.Error())
+				}
+			}
+		}
+	}
+
+	// Perform Scale Check and Procedure
+	if podFound && instance.Spec.ScalePVC != nil && !inMaintenance(instance) {
+		pvc, volume, err := getPVCFromPod(ctx, r, pod)
+		if err != nil && apierrs.IsNotFound(err) {
+			log.Info("the PVC associated with notebook Pod not found")
+		} else {
+			threshold := instance.Spec.ScalePVC.Threshold
+			scaleFactor := instance.Spec.ScalePVC.ScaleFactor
+			maxCapacity := instance.Spec.ScalePVC.MaxCapacity
+			log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
+			log.Info(fmt.Sprintf("Threshold is set at: %d%% and ScaleFactor is set to: %d", threshold, scaleFactor))
+			percentSpaceUsed, err := pvcStorageUsed(r, instance, volume, pod, pvc)
+			if err != nil {
+				log.Info("Encountered error when retrieving space used.")
+			} else {
+				log.Info(fmt.Sprintf("PVC: %s disk space is at %d%% capacity", pvc.Name, percentSpaceUsed))
+				if percentSpaceUsed > threshold {
+					currentPVCUsage := pvc.Status.Capacity["storage"]
+					if currentPVCUsage.Value() >= maxCapacity.Value() {
+						log.Info("PVC has reached the maximum allowed capacity, cannot scale up")
+					} else {
+						log.Info(fmt.Sprintf("PVC Capacity is above threshold (%d%%), marking it to be scaled up.", threshold))
+						// Add the inMaintenance label to the notebook
+						log.Info(fmt.Sprintf("Applying Maintenance Label To Statefulset %s.", ss.Name))
+						err = markForMaintenance(ctx, r, instance)
+						if err != nil {
+							log.Info("Encountered error when attempting to add maintenance label to notebook.")
+						} else {
+							err := sendMaintenanceEmail(instance)
+							if err != nil {
+								log.Info("Failed to send email notification.")
+								log.Info(err.Error())
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -248,6 +402,312 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	return ctrl.Result{}, nil
 }
+
+/// ------------------------------ SCALABLE PVC FUNCTIONS --------------------------------------------------------------
+
+func podCrashed(pod *corev1.Pod) bool {
+	if len(pod.Status.ContainerStatuses) > 0 {
+		return pod.Status.ContainerStatuses[0].State.Terminated != nil
+	}
+	return false
+}
+
+// TODO
+func scaleUpPVC(pvc *corev1.PersistentVolumeClaim, scaleFactor int, maxCapacity resource.Quantity) (*corev1.PersistentVolumeClaim, error) {
+	if scaleFactor <= 1 {
+		return nil, fmt.Errorf("scaling factor is %v it should be >1", scaleFactor)
+	}
+
+	scaledUpPVC := pvc.DeepCopy()
+	currentPVCQuantity := pvc.Spec.Resources.Requests["storage"]
+
+	if currentPVCQuantity.Value() >= maxCapacity.Value() {
+		return nil, fmt.Errorf("PVC already at max capacity: %v ", maxCapacity.String())
+	}
+	newPVCQuantityValue := currentPVCQuantity.Value() * int64(scaleFactor)
+	if newPVCQuantityValue > maxCapacity.Value() {
+		newPVCQuantityValue = maxCapacity.Value()
+	}
+	scaledUpQuantity := resource.NewQuantity(newPVCQuantityValue, currentPVCQuantity.Format)
+	scaledUpPVC.Spec.Resources.Requests["storage"] = *scaledUpQuantity
+
+	return scaledUpPVC, nil
+}
+
+func sendScaledUpEmail(notebook *v1beta1.Notebook) error {
+
+	smtpServer := os.Getenv("SMTP_SERVER")
+	from := os.Getenv("SMTP_FROM_EMAIL")
+
+	// Get User email from the Notebook properties
+	to := []string{notebook.Spec.UserInfo.Email}
+
+	msg := []byte(fmt.Sprintf("To: %s \r\n", to) +
+		"Subject: [Notebook-Controller] PVC Maintenance Notice\r\n" +
+		"\r\n" +
+		"The Storage for your Notebook was successfully increased.\r\n")
+	err := smtp.SendMail(smtpServer, nil, from, to, msg)
+
+	return err
+}
+
+func sendMaintenanceEmail(notebook *v1beta1.Notebook) error {
+
+	smtpServer := os.Getenv("SMTP_SERVER")
+	from := os.Getenv("SMTP_FROM_EMAIL")
+
+	// Get User email from the Notebook properties
+	to := []string{notebook.Spec.UserInfo.Email}
+
+	msg := []byte(fmt.Sprintf("To: %s \r\n", to) +
+		"Subject: [Notebook-Controller] PVC Maintenance Notice\r\n" +
+		"\r\n" +
+		"The Storage for your Notebook has been marked for scaling up and will be increased on the next pod restart or pod crash.\r\n")
+	err := smtp.SendMail(smtpServer, nil, from, to, msg)
+
+	return err
+}
+
+func createScaledUpPvc(ctx context.Context, r *NotebookReconciler,
+	oldPVC *corev1.PersistentVolumeClaim, notebook *v1beta1.Notebook) (*corev1.PersistentVolumeClaim, error) {
+	oldStorage := oldPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+	newStorage := oldStorage.DeepCopy()
+	newStorage.Add(oldStorage)
+	newPVC := &corev1.PersistentVolumeClaim{
+		TypeMeta: oldPVC.TypeMeta,
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "notebook-pvc-",
+			Namespace:    oldPVC.Namespace,
+			Labels:       map[string]string{"notebook": notebook.Name},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: newStorage,
+				},
+			},
+		},
+	}
+	err := r.Create(ctx, newPVC)
+	if err != nil {
+		return &corev1.PersistentVolumeClaim{}, err
+	}
+	return newPVC, nil
+}
+
+func startPVCMaintenance(ctx context.Context, r *NotebookReconciler, pod *corev1.Pod,
+	notebook *v1beta1.Notebook, log logr.Logger) (*batchv1.Job, *corev1.PersistentVolumeClaim, error) {
+	pvc, _, err := getPVCFromPod(ctx, r, pod)
+
+	// Create new PVC
+	log.Info("Creating Scaled up PVC")
+	scaledUpPVC, err := createScaledUpPvc(ctx, r, pvc, notebook)
+	if err != nil {
+		log.Info("Encountered error when creating scaled up PVC.")
+		return nil, nil, err
+	}
+
+	// Start Scale Job to run in the background
+	log.Info("Starting scale job.")
+	scaleJob := generateRsyncJob(pvc, scaledUpPVC, notebook)
+	err = r.Create(ctx, scaleJob)
+	if err != nil {
+		log.Info("Could not start scale job.")
+		log.Info(err.Error())
+		return nil, scaledUpPVC, err
+	}
+	// save the job name to the Notebook resource as a label
+	notebookNew := notebook.DeepCopy()
+	if notebookNew.ObjectMeta.Labels == nil {
+		notebookNew.ObjectMeta.Labels = map[string]string{}
+	}
+	notebookNew.ObjectMeta.Labels[ScaleJobLabelKey] = scaleJob.Name
+	err = r.Patch(ctx, notebookNew, client.MergeFrom(notebook))
+	if err != nil {
+		log.Info("error attaching the scale-job label.")
+		return scaleJob, scaledUpPVC, err
+	}
+	log.Info(scaleJob.Name)
+	//sendMaintenanceEmail()
+	return scaleJob, scaledUpPVC, nil
+}
+
+// Assumes there is only One PVC
+func getPVCFromPod(ctx context.Context, r *NotebookReconciler, pod *corev1.Pod) (*corev1.PersistentVolumeClaim, *corev1.Volume, error) {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := r.Get(ctx, types.NamespacedName{
+				Name:      volume.PersistentVolumeClaim.ClaimName,
+				Namespace: pod.Namespace,
+			}, pvc)
+			if err != nil {
+				return pvc, &volume, err
+			}
+			return pvc, &volume, nil
+		}
+	}
+	return &corev1.PersistentVolumeClaim{}, &corev1.Volume{}, errors.New("could not find Persistent Volume Claim")
+}
+
+func inMaintenance(notebook *v1beta1.Notebook) bool {
+	if val, ok := notebook.Labels[MaintenanceLabelKey]; ok {
+		return val == "true"
+	}
+	return false
+}
+
+func setNotebookLabel(ctx context.Context, r *NotebookReconciler, notebook *v1beta1.Notebook, labelKey string, labelValue string) error {
+	notebookNew := notebook.DeepCopy()
+	if notebookNew.ObjectMeta.Labels == nil {
+		notebookNew.ObjectMeta.Labels = map[string]string{}
+	}
+	notebookNew.ObjectMeta.Labels[labelKey] = labelValue
+	err := r.Patch(ctx, notebookNew, client.MergeFrom(notebook))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func markForMaintenance(ctx context.Context, r *NotebookReconciler, notebook *v1beta1.Notebook) error {
+	return setNotebookLabel(ctx, r, notebook, MaintenanceLabelKey, "true")
+}
+
+func pvcStorageUsed(r *NotebookReconciler, notebook *v1beta1.Notebook, volume *corev1.Volume,
+	pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) (int, error) {
+	// Get volumeMount path
+	volumeMountPath := ""
+	for _, container := range notebook.Spec.Template.Spec.Containers {
+		for _, volumeMount := range container.VolumeMounts {
+			if volumeMount.Name == volume.Name {
+				volumeMountPath = volumeMount.MountPath
+				break
+			}
+		}
+	}
+	if volumeMountPath == "" {
+		// return error("Could not find volumeMountPath, aborting disk usage check.")
+		return 0, errors.New("could not find volumeMountPath, aborting disk usage check")
+	}
+	shellCommand := fmt.Sprintf("du -hs -BK %s | awk '{print $1}'", volumeMountPath)
+	usedSpace, err := execCommand([]string{"sh", "-c", shellCommand}, pod, r)
+	if err != nil {
+		return 0, err
+	}
+
+	// Check if the amount of free space is under threshold
+	requestQuant := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	usedSpaceQuant, err := resource.ParseQuantity(strings.TrimSpace(usedSpace) + "i") // append "i" to convert to k8s binary SI unit
+	if err != nil {
+		return 0, errors.New("could not parse used space quantity into resource quantity aborting usage check")
+	}
+
+	requestQuantInt := requestQuant.Value()
+	usedSpaceQuantInt := usedSpaceQuant.Value()
+
+	percentSpaceUsed := int((float64(usedSpaceQuantInt) / float64(requestQuantInt)) * 100)
+	return percentSpaceUsed, nil
+}
+
+func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (string, error) {
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return "", err
+	}
+
+	restClient, err := apiutil.RESTClientForGVK(pod.GroupVersionKind(), cfg, scheme.Codecs)
+	if err != nil {
+		return "", err
+	}
+	execReq := restClient.Post().Resource("pods").Name(pod.Name).Namespace(pod.Namespace).SubResource("exec")
+	parameterCodec := runtime.NewParameterCodec(r.Scheme)
+	execReq.VersionedParams(&corev1.PodExecOptions{
+		Command: command,
+		Stdin:   true,
+		Stdout:  true,
+		Stderr:  true,
+	}, parameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", execReq.URL())
+	if err != nil {
+		return "", err
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.Stream(remotecommand.StreamOptions{
+		Stdin:  os.Stdin,
+		Stdout: &stdout,
+		Stderr: &stderr,
+		Tty:    false,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return stdout.String(), nil
+}
+
+func generateRsyncJob(sourcePvc *corev1.PersistentVolumeClaim, destPvc *corev1.PersistentVolumeClaim,
+	notebook *v1beta1.Notebook) *batchv1.Job {
+
+	// Define the desired Service object
+	parallelism := int32(1)
+	completions := int32(1)
+
+	srcVolume := corev1.Volume{
+		Name: "source-vol",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: sourcePvc.Name,
+			},
+		},
+	}
+	destVolume := corev1.Volume{
+		Name: "dest-vol",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: destPvc.Name,
+			},
+		},
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: notebook.Name + ScaleJobPrefix + "-",
+			Namespace:    sourcePvc.Namespace,
+			Labels:       map[string]string{"notebook": notebook.Name, "scale-pvc-name": sourcePvc.Name},
+		},
+		Spec: batchv1.JobSpec{
+			Parallelism: &parallelism,
+			Completions: &completions,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+					"statefulset":   sourcePvc.Name,
+					"notebook-name": sourcePvc.Name,
+				}},
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{srcVolume, destVolume},
+					Containers: []corev1.Container{{
+						Name:    "rsync",
+						Image:   "eeacms/rsync:2.3",
+						Command: []string{"rsync", "/tmp/source/", "/tmp/dest/", "-r"},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: srcVolume.Name, ReadOnly: true, MountPath: "/tmp/source"},
+							{Name: destVolume.Name, ReadOnly: false, MountPath: "/tmp/dest"},
+						},
+					},
+					},
+					RestartPolicy: corev1.RestartPolicyNever,
+				},
+			},
+		},
+	}
+	return job
+}
+
+/// ------------------------------ SCALABLE PVC FUNCTIONS END ----------------------------------------------------------
 
 func getNextCondition(cs corev1.ContainerState) v1beta1.NotebookCondition {
 	var nbtype = ""
@@ -485,7 +945,7 @@ func nbNameFromInvolvedObject(c client.Client, object *corev1.ObjectReference) (
 		pod := &corev1.Pod{}
 		err := c.Get(
 			context.TODO(),
-			types.NamespacedName {
+			types.NamespacedName{
 				Namespace: namespace,
 				Name:      name,
 			},
@@ -521,6 +981,7 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		virtualService.SetKind("VirtualService")
 		builder.Owns(virtualService)
 	}
+	builder.WithOptions(controller.Options{MaxConcurrentReconciles: 1})
 
 	// TODO(lunkai): After this is fixed:
 	// https://github.com/kubernetes-sigs/controller-runtime/issues/572
@@ -530,6 +991,8 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
+	// We're adding Pods associated with the notebook stateful sets to be enqueued upon
+	// Update and Creation, so that they maybe handled during reconciliation
 	// watch underlying pod
 	mapFn := handler.ToRequestsFunc(
 		func(a handler.MapObject) []ctrl.Request {
@@ -540,21 +1003,37 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}},
 			}
 		})
+
 	p := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
+			// Check if event is a notebook-event
 			if _, ok := e.MetaOld.GetLabels()["notebook-name"]; !ok {
 				return false
 			}
+			// Return True if the object updated
 			return e.ObjectOld != e.ObjectNew
 		},
 		CreateFunc: func(e event.CreateEvent) bool {
+			// Check if event is a notebook-event
 			if _, ok := e.Meta.GetLabels()["notebook-name"]; !ok {
 				return false
 			}
+			// Return true if the notebook-event object was created
+			return true
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			// Check if event is a notebook-event
+			if _, ok := e.Meta.GetLabels()["notebook-name"]; !ok {
+				return false
+			}
+			// Return true if the notebook-event object was created
 			return true
 		},
 	}
 
+	// Not to be confused with events handled by eventhandlers, these are
+	// the k8s Event kind that will be enqueued as reconcile.requests
+	// We filter for Event kinds for Creation/Updates on Sts or Pods
 	eventToRequest := handler.ToRequestsFunc(
 		func(a handler.MapObject) []ctrl.Request {
 			return []reconcile.Request{
@@ -587,6 +1066,8 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		},
 	}
 
+	// TODO (Humair): Add a watch on Job events with a label: "jobType=ScaleJob"
+	// These watches will enqueue Pods and (sts/pod) Events upon Update/Creation.
 	if err = c.Watch(
 		&source.Kind{Type: &corev1.Pod{}},
 		&handler.EnqueueRequestsFromMapFunc{
