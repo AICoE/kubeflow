@@ -3,9 +3,12 @@ kind: Notebook
 metadata:
   name: jupyter-test
 spec:
+  scalePVC:
+    threshold: 50  # percentage
+    scaleFactor: 2
+    maxCapacity: 4Gi
   template:
     spec:
-      serviceAccountName: default-editor
       volumes:
         - name: test-vol
           persistentVolumeClaim:
